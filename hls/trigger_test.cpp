@@ -24,7 +24,7 @@ int main()
 
     // Raw data setting.
     for(int j = 0; j < N_CH; j++){
-        dds_data tmpd;
+        dds_t tmpd;
         x = j+1;
         y = 0;
         tmpd = y.concat(x);

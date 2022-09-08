@@ -1,58 +1,7 @@
 #include "trigger.hpp"
 
-static unsigned int count = 0;
-static unsigned int pre_count = 0;
-static bool triggered = false;
-static bool pre_ready = false;
 
-
-void trigger_core(hls::stream<double> &phase_in,
-                  const double trigger_low[N_CH],
-                  const double trigger_high[N_CH],
-                  hls::stream<bool> &trig_out){
-    bool trigger = false;
-    for (int i = 0; i < N_CH; i++){
-#pragma HLS pipeline II=1
-        double phase;
-        phase_in.read(phase);
-        if ((phase < trigger_low[i]) || (trigger_high[i] < phase)){
-            if (pre_ready){
-                trigger = true;
-            }
-        }
-    }
-
-    trig_out.write(trigger);
-}
-
-void data_buffer(dds_in &data_in,
-                 dds_in &data_out,
-                 const int pre_length){
-    int length = 0;
-    dds_in buffer;
-    while(length < pre_length*N_CH){
-        buffer.write(data_in.read());
-    }
-
-    while (true)
-        data_out.write(buffer.read());
-}
-
-void data_publisher(dds_in &data_delayed, dds_in &data_out, hls::stream<bool> &trig_in){
-    if(trig_in.read()){
-        for(int i = 0; i < N_CH; i++){
-#pragma HLS pipeline II=1
-            data_out.write(data_delayed.read());
-        }
-    } else {
-        for(int i = 0; i < N_CH; i++){
-#pragma HLS pipeline II=1
-            data_delayed.read();
-        }
-    }
-}
-
-void trigger(dds_in &data_in,
+void trigger(dds_str_t &data_in,
              hls::stream<double> &phase_in,
              dds_in &data_out,
              const double trigger_low[N_CH],
@@ -70,14 +19,78 @@ void trigger(dds_in &data_in,
     // Ctrl interface suppression.
     #pragma HLS INTERFACE ap_ctrl_none port=return
 
-    dds_in data_delayed;
-    dds_in buffer;
+    dds_str_t data_delayed;
+    dds_str_t buffer;
     hls::stream<bool> trig_buf;
+    hls::stream_of_blocks<dds_block_t> data_buf;
 
     unsigned int total_length = (pre_length + post_length) * N_CH;
 
 #pragma HLS DATAFLOW
-    trigger_core(phase_in, trigger_low, trigger_high, trig_buf);
-    data_buffer(data_in, data_delayed, pre_length);
-    data_publisher(data_delayed, data_out, trig_buf);
+    
+    trigger_core(phase_in, data_in, trigger_low, trigger_high, data_buf, trig_buf);
+
+    data_buffer(data_buf, trig_buf, data_out, pre_length);
+}
+
+void trigger_core(hls::stream<double> &phase_in,
+                  dds_str_t &data_in,
+                  const double trigger_low[N_CH],
+                  const double trigger_high[N_CH],
+                  hls::stream_of_blocks<dds_block_t> &data_block_out,
+                  hls::stream<bool> &trig_out){
+
+#pragma HLS INLINE off
+
+    // Sampling loop.
+    core_loop0: for (int i = 0; i < MAX_PRE_LEN; i++){
+#pragma HLS pipeline II=16
+        bool trigger = false;
+
+        hls::write_lock<block_data_t> outL(data_block_out);
+
+        // Channel loop.
+        core_loop1: for (unsigned int j = 0; j < N_CH; j++) {
+            double phase = phase_in.read();
+            if ((phase < trigger_low[j]) || (trigger_high[j] < phase)){
+                trigger = true;
+            }
+            outL[j] = data_in.read();
+        }
+        trig_out.write(trigger);
+    }
+}
+
+void data_buffer(hls::stream_of_blocks<dds_block_t> &data_block_in,
+                 hls::stream<bool> &trig_in,
+                 dds_str_t &data_out,
+                 const int pre_length){
+#pragma HLS INLINE off
+
+    dds_str_t data_buffer;
+    // Sampling loop
+    buffer_loop0: for(int i = 0; i < pre_length; i++){
+#pragma HLS pipeline II=16
+        hls::read_lock<block_data_t> inL(data_block_in);
+
+        buffer_loop1: for(int j = 0; j < N_CH; j++){
+            data_buffer.write(inL[j]);
+        }
+    }
+
+    // trigger
+    trigger: while (true) {
+#pragma HLS pipeline II=16
+        bool trigger = trig_in.read();
+        if (trigger) {
+            for(int j = 0; j < N_CH; j++){
+                data_out.write(data_buffer.read());
+            }
+            return;
+        } else {
+            for(int j = 0; j < N_CH; j++){
+                data_buffer.read();
+            }
+        }
+    }
 }
